@@ -11,16 +11,16 @@ install anything into `PATH`.
 
 ## Package installation
 
-After this directory is published in a GitHub monorepo, install it with:
+Install it with:
 
 ```sh
-ya pkg add OWNER/REPOSITORY:nifti-preview
+ya pkg add EmmetZ/nifti-preview.yazi:nifti-preview
 ```
 
 Upgrade it with:
 
 ```sh
-ya pkg upgrade OWNER/REPOSITORY:nifti-preview
+ya pkg upgrade EmmetZ/nifti-preview.yazi:nifti-preview
 ```
 
 Register it before generic gzip previewers in `yazi.toml`:
