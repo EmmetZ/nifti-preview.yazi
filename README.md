@@ -1,24 +1,18 @@
 # yazi-nifti-preview
 
-Rust helper source and release package for the `nifti-preview.yazi` Yazi plugin.
+Self-contained NIfTI-1 (`.nii` and `.nii.gz`) preview plugin for Yazi. The
+bundled Rust helper renders an upright RAS image, supports `J`/`K` slice
+navigation, and does not require a separate executable in `PATH`.
 
-## Build the package
-
-```sh
-./scripts/build-package.sh
-```
-
-For local installation, copy only the release package:
+## Install
 
 ```sh
-cp -a nifti-preview.yazi ~/.config/yazi/plugins/
+ya pkg add EmmetZ/nifti-preview.yazi:nifti-preview
 ```
 
-The package directory contains only the three files recognized by `ya pkg` and
-the bundled executable under `assets/`. See its README for publication and
-configuration instructions.
+## Configure
 
-Register the plugin before generic gzip previewers:
+Register the previewer before generic gzip rules in `yazi.toml`:
 
 ```toml
 [plugin]
@@ -32,4 +26,29 @@ prepend_preloaders = [
 ]
 ```
 
-The Rust crate remains outside the installed plugin directory.
+Route `J` and `K` through the plugin in `keymap.toml`:
+
+```toml
+[mgr]
+prepend_keymap = [
+  { on = "K", run = "plugin nifti-preview -1", desc = "Previous NIfTI slice / seek preview up" },
+  { on = "J", run = "plugin nifti-preview 1", desc = "Next NIfTI slice / seek preview down" },
+]
+```
+
+## Upgrade
+
+```sh
+ya pkg upgrade EmmetZ/nifti-preview.yazi:nifti-preview
+```
+
+## Releases
+
+Pushing an annotated semantic-version tag triggers the GitHub Actions release
+workflow. It tests the locked dependency graph, builds the Linux x86_64 helper,
+and attaches a compressed binary plus `SHA256SUMS` to the GitHub Release.
+
+```sh
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```

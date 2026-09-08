@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Test locked dependency graph
+        run: cargo test --all-targets --locked
+
+      - name: Build Linux x86_64 helper
+        run: cargo build --release --locked
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="yazi-nifti-preview-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir dist
+          install -m 755 target/release/yazi-nifti-preview dist/yazi-nifti-preview
+          tar -C dist -czf "dist/${archive}" yazi-nifti-preview
+          rm dist/yazi-nifti-preview
+          sha256sum "dist/${archive}" > dist/SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS

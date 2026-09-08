@@ -1,15 +1,13 @@
 # nifti-preview.yazi
 
-NIfTI-1 (`.nii` and `.nii.gz`) grayscale previewer for Yazi. It selects one
-principal anatomical plane, resamples oblique acquisitions onto an upright RAS
-grid, shows the middle slice initially, and uses `J`/`K` to move by one slice.
-Axial and coronal images use the radiological convention (patient left appears
-on screen right).
+NIfTI-1 (`.nii` and `.nii.gz`) grayscale previewer for Yazi. It resamples
+oblique acquisitions onto an upright RAS grid, uses the radiological convention
+for axial and coronal images, and supports `J`/`K` slice navigation.
 
 The current package contains a Linux x86_64 helper in `assets/` and does not
 install anything into `PATH`.
 
-## Package installation
+## Install
 
 Install it with:
 
@@ -17,13 +15,9 @@ Install it with:
 ya pkg add EmmetZ/nifti-preview.yazi:nifti-preview
 ```
 
-Upgrade it with:
+## Configure
 
-```sh
-ya pkg upgrade EmmetZ/nifti-preview.yazi:nifti-preview
-```
-
-Register it before generic gzip previewers in `yazi.toml`:
+Register the previewer before generic gzip previewers in `yazi.toml`:
 
 ```toml
 [plugin]
@@ -37,8 +31,7 @@ prepend_preloaders = [
 ]
 ```
 
-Route the default preview seek keys through the plugin in `keymap.toml`. For
-non-NIfTI files these bindings forward to Yazi's original five-unit seek:
+Route `J` and `K` through the plugin in `keymap.toml`:
 
 ```toml
 [mgr]
@@ -46,4 +39,10 @@ prepend_keymap = [
   { on = "K", run = "plugin nifti-preview -1", desc = "Previous NIfTI slice / seek preview up" },
   { on = "J", run = "plugin nifti-preview 1", desc = "Next NIfTI slice / seek preview down" },
 ]
+```
+
+## Upgrade
+
+```sh
+ya pkg upgrade EmmetZ/nifti-preview.yazi:nifti-preview
 ```
