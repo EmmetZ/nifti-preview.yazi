@@ -4,6 +4,10 @@ Self-contained NIfTI-1 (`.nii` and `.nii.gz`) preview plugin for Yazi. The
 bundled Rust helper renders an upright RAS image, supports `J`/`K` slice
 navigation, and does not require a separate executable in `PATH`.
 
+Yazi deploys package files as read-only. On Unix, the plugin restores the
+bundled helper's user execute permission automatically when it first previews a
+NIfTI file.
+
 ## Install
 
 ```sh

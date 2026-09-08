@@ -18,6 +18,7 @@ local function helper_path()
 end
 
 local HELPER = helper_path()
+local helper_permissions_ready = package.config:sub(1, 1) == "\\"
 
 local entry_context = ya.sync(function()
   local hovered = cx.active.current.hovered
@@ -30,7 +31,31 @@ local function message(job, text)
   })
 end
 
+local function ensure_helper_permissions()
+  if helper_permissions_ready then
+    return nil
+  end
+  local output, err = Command("chmod")
+      :arg({ "u+x", HELPER })
+      :stdout(Command.PIPED)
+      :stderr(Command.PIPED)
+      :output()
+  if not output then
+    return string.format("Failed to set execute permission on bundled helper: %s", tostring(err))
+  end
+  if not output.status.success then
+    local detail = output.stderr:gsub("%s+$", "")
+    return detail ~= "" and detail or "Failed to set execute permission on bundled helper"
+  end
+  helper_permissions_ready = true
+  return nil
+end
+
 local function run(args)
+  local permission_error = ensure_helper_permissions()
+  if permission_error then
+    return nil, permission_error
+  end
   local output, err = Command(HELPER)
       :arg(args)
       :stdout(Command.PIPED)

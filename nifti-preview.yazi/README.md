@@ -7,6 +7,10 @@ for axial and coronal images, and supports `J`/`K` slice navigation.
 The current package contains a Linux x86_64 helper in `assets/` and does not
 install anything into `PATH`.
 
+Yazi deploys package files as read-only. On Unix, the plugin restores the
+bundled helper's user execute permission automatically when it first previews a
+NIfTI file.
+
 ## Install
 
 Install it with:
