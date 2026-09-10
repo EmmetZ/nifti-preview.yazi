@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use yazi_nifti_preview::{probe, render};
+use yazi_nifti_preview::{probe_named, render_named};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,10 +18,14 @@ enum Command {
     Probe {
         #[arg(long)]
         input: PathBuf,
+        #[arg(long, value_name = "LOGICAL_FILENAME")]
+        name: Option<String>,
     },
     Render {
         #[arg(long)]
         input: PathBuf,
+        #[arg(long, value_name = "LOGICAL_FILENAME")]
+        name: Option<String>,
         #[arg(long, value_name = "ZERO_BASED_INDEX")]
         slice: Option<usize>,
     },
@@ -29,8 +33,12 @@ enum Command {
 
 fn run() -> yazi_nifti_preview::Result<()> {
     let result = match Cli::parse().command {
-        Command::Probe { input } => serde_json::to_string(&probe(&input)?)?,
-        Command::Render { input, slice } => serde_json::to_string(&render(&input, slice)?)?,
+        Command::Probe { input, name } => {
+            serde_json::to_string(&probe_named(&input, name.as_deref())?)?
+        }
+        Command::Render { input, name, slice } => {
+            serde_json::to_string(&render_named(&input, name.as_deref(), slice)?)?
+        }
     };
     println!("{result}");
     Ok(())

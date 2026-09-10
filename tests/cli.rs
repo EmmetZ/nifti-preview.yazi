@@ -215,3 +215,41 @@ fn corrupted_and_nifti_two_inputs_fail_without_stdout_json() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn vfs_cache_paths_use_the_logical_filename_for_format_detection() {
+    for (logical_name, gzip) in [("remote.nii", false), ("remote.nii.gz", true)] {
+        let directory = TempDir::new().unwrap();
+        let cached = directory.path().join("7f6c18d09c604f8cb11c1bc8e72f1154");
+        fixture(3, [4, 3, 2, 1], 4, 16, gzip, &cached);
+
+        let probed = json(&run(&[
+            "probe",
+            "--input",
+            cached.to_str().unwrap(),
+            "--name",
+            logical_name,
+        ]));
+        assert_eq!(probed["slice_count"], 2);
+
+        let rendered = json(&run(&[
+            "render",
+            "--input",
+            cached.to_str().unwrap(),
+            "--name",
+            logical_name,
+        ]));
+        assert!(Path::new(rendered["image"].as_str().unwrap()).is_file());
+    }
+}
+
+#[test]
+fn extensionless_input_without_a_logical_filename_is_rejected() {
+    let directory = TempDir::new().unwrap();
+    let cached = directory.path().join("7f6c18d09c604f8cb11c1bc8e72f1154");
+    fixture(3, [2, 2, 2, 1], 2, 8, false, &cached);
+
+    let output = run(&["probe", "--input", cached.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported input"));
+}

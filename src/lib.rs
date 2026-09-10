@@ -1,11 +1,12 @@
+use flate2::bufread::GzDecoder;
 use image::{GrayImage, ImageBuffer, Luma};
 use nifti::volume::ndarray::IntoNdArray;
-use nifti::{NiftiHeader, NiftiObject, NiftiType, ReaderStreamedOptions};
+use nifti::{NiftiHeader, NiftiObject, NiftiType, StreamedNiftiObject};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,6 +46,35 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFormat {
+    Nii,
+    NiiGz,
+}
+
+impl InputFormat {
+    fn cache_tag(self) -> &'static [u8] {
+        match self {
+            Self::Nii => b"nii",
+            Self::NiiGz => b"nii.gz",
+        }
+    }
+}
+
+enum InputReader {
+    Plain(BufReader<File>),
+    Gzip(GzDecoder<BufReader<File>>),
+}
+
+impl Read for InputReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(buffer),
+            Self::Gzip(reader) => reader.read(buffer),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,22 +135,34 @@ impl CacheMeta {
 }
 
 pub fn probe(input: &Path) -> Result<ProbeResult> {
-    validate_path(input)?;
-    let key = cache_key(input)?;
+    probe_named(input, None)
+}
+
+pub fn probe_named(input: &Path, logical_name: Option<&str>) -> Result<ProbeResult> {
+    let format = input_format(input, logical_name)?;
+    let key = cache_key(input, format)?;
     let cache_dir = cache_root().join(key);
     if let Some(meta) = read_meta(&cache_dir)? {
         return Ok(meta.probe());
     }
-    Ok(geometry_from_header(&read_header(input)?)?.probe())
+    Ok(geometry_from_header(&read_header(input, format)?)?.probe())
 }
 
 pub fn render(input: &Path, requested_slice: Option<usize>) -> Result<RenderResult> {
-    validate_path(input)?;
-    let key = cache_key(input)?;
+    render_named(input, None, requested_slice)
+}
+
+pub fn render_named(
+    input: &Path,
+    logical_name: Option<&str>,
+    requested_slice: Option<usize>,
+) -> Result<RenderResult> {
+    let format = input_format(input, logical_name)?;
+    let key = cache_key(input, format)?;
     let root = cache_root();
     fs::create_dir_all(&root)?;
     let cache_dir = root.join(&key);
-    ensure_image_cache(input, &root, &cache_dir, &key)?;
+    ensure_image_cache(input, format, &root, &cache_dir, &key)?;
     let meta = read_meta(&cache_dir)?.ok_or(Error::InvalidGeometry("missing cache metadata"))?;
     let slice = requested_slice.unwrap_or_else(|| meta.slice_count() / 2);
     if slice >= meta.slice_count() {
@@ -146,21 +188,36 @@ pub fn render(input: &Path, requested_slice: Option<usize>) -> Result<RenderResu
     })
 }
 
-fn validate_path(path: &Path) -> Result<()> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_ascii_lowercase)
+fn input_format(path: &Path, logical_name: Option<&str>) -> Result<InputFormat> {
+    let name = logical_name
+        .map(str::to_owned)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .map(|name| name.to_ascii_lowercase())
         .ok_or(Error::UnsupportedPath)?;
-    if name.ends_with(".nii") || name.ends_with(".nii.gz") {
-        Ok(())
+    if name.ends_with(".nii.gz") {
+        Ok(InputFormat::NiiGz)
+    } else if name.ends_with(".nii") {
+        Ok(InputFormat::Nii)
     } else {
         Err(Error::UnsupportedPath)
     }
 }
 
-fn read_header(path: &Path) -> Result<NiftiHeader> {
-    let object = ReaderStreamedOptions::new().read_file(path)?;
+fn read_object(path: &Path, format: InputFormat) -> Result<StreamedNiftiObject<InputReader>> {
+    let file = BufReader::new(File::open(path)?);
+    let reader = match format {
+        InputFormat::Nii => InputReader::Plain(file),
+        InputFormat::NiiGz => InputReader::Gzip(GzDecoder::new(file)),
+    };
+    Ok(StreamedNiftiObject::from_reader(reader)?)
+}
+
+fn read_header(path: &Path, format: InputFormat) -> Result<NiftiHeader> {
+    let object = read_object(path, format)?;
     let header = object.header().clone();
     validate_header(&header)?;
     Ok(header)
@@ -427,7 +484,13 @@ fn invert_affine(affine: &[[f64; 4]; 4]) -> Result<[[f64; 4]; 3]> {
     }))
 }
 
-fn ensure_image_cache(input: &Path, root: &Path, cache_dir: &Path, key: &str) -> Result<()> {
+fn ensure_image_cache(
+    input: &Path,
+    format: InputFormat,
+    root: &Path,
+    cache_dir: &Path,
+    key: &str,
+) -> Result<()> {
     if read_meta(cache_dir)?.is_some() && cache_dir.join("complete").is_file() {
         return Ok(());
     }
@@ -437,7 +500,7 @@ fn ensure_image_cache(input: &Path, root: &Path, cache_dir: &Path, key: &str) ->
     }
 
     fs::create_dir_all(cache_dir)?;
-    let object = ReaderStreamedOptions::new().read_file(input)?;
+    let object = read_object(input, format)?;
     let header = object.header().clone();
     validate_header(&header)?;
     let meta = geometry_from_header(&header)?;
@@ -712,7 +775,7 @@ fn cache_root() -> PathBuf {
     std::env::temp_dir().join("yazi-nifti-preview")
 }
 
-fn cache_key(path: &Path) -> Result<String> {
+fn cache_key(path: &Path, format: InputFormat) -> Result<String> {
     let canonical = fs::canonicalize(path)?;
     let metadata = fs::metadata(&canonical)?;
     let modified = metadata
@@ -721,6 +784,7 @@ fn cache_key(path: &Path) -> Result<String> {
         .unwrap_or_default();
     let mut hash = Sha256::new();
     hash.update(CACHE_VERSION.as_bytes());
+    hash.update(format.cache_tag());
     hash.update(canonical.as_os_str().as_encoded_bytes());
     hash.update(metadata.len().to_le_bytes());
     hash.update(modified.as_secs().to_le_bytes());

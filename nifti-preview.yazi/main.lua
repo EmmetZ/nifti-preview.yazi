@@ -22,13 +22,31 @@ local helper_permissions_ready = package.config:sub(1, 1) == "\\"
 
 local entry_context = ya.sync(function()
   local hovered = cx.active.current.hovered
-  return hovered and tostring(hovered.url), cx.active.preview.skip
+  return hovered and tostring(hovered.url),
+      hovered and tostring(hovered.path),
+      hovered and hovered.name and tostring(hovered.name),
+      hovered and hovered.url.spec.is_regular,
+      hovered and hovered.cha.len,
+      cx.active.preview.skip
 end)
 
 local function message(job, text)
-  ya.preview_widgets(job, {
-    ui.Text(text):align(ui.Text.CENTER):area(job.area),
-  })
+  ya.preview_widget(job, ui.Text(text):area(job.area):align(ui.Align.CENTER):wrap(ui.Wrap.YES))
+end
+
+local function path_ready(path, is_regular, expected_len)
+  local cha = fs.cha(Url(path))
+  if not cha then
+    return false
+  end
+  if is_regular then
+    return true
+  end
+  return cha.len == expected_len
+end
+
+local function content_ready(file)
+  return path_ready(file.path, file.url.spec.is_regular, file.cha.len)
 end
 
 local function ensure_helper_permissions()
@@ -76,7 +94,18 @@ local function run(args)
 end
 
 function M:peek(job)
-  local args = { "render", "--input", tostring(job.file.url) }
+  if not content_ready(job.file) then
+    local text = job.file.url.spec.is_regular
+        and "NIfTI file is not available"
+        or "Remote NIfTI file, download to preview"
+    message(job, text)
+    return
+  end
+  local args = { "render", "--input", tostring(job.file.path) }
+  if job.file.name then
+    args[#args + 1] = "--name"
+    args[#args + 1] = tostring(job.file.name)
+  end
   if job.skip > 0 then
     args[#args + 1] = "--slice"
     args[#args + 1] = tostring(job.skip - 1)
@@ -90,11 +119,19 @@ function M:peek(job)
 end
 
 function M:seek(job)
-  self:seek_url(job.file.url, cx.active.preview.skip, job.units)
+  if not content_ready(job.file) then
+    return
+  end
+  self:seek_file(job.file.url, job.file.path, job.file.name, cx.active.preview.skip, job.units)
 end
 
-function M:seek_url(url, current, units)
-  local result = run({ "probe", "--input", tostring(url) })
+function M:seek_file(url, path, name, current, units)
+  local args = { "probe", "--input", tostring(path) }
+  if name then
+    args[#args + 1] = "--name"
+    args[#args + 1] = tostring(name)
+  end
+  local result = run(args)
   if not result then
     return
   end
@@ -108,20 +145,32 @@ end
 
 function M:entry(job)
   local units = tonumber(job.args[1]) or 0
-  local url, current = entry_context()
-  if not url then
+  local url, path, name, is_regular, expected_len, current = entry_context()
+  if not url or not path then
     return
   end
   local lower = url:lower()
   if lower:match("%.nii$") or lower:match("%.nii%.gz$") then
-    self:seek_url(Url(url), current, units)
+    if not path_ready(path, is_regular, expected_len) then
+      return
+    end
+    self:seek_file(Url(url), path, name, current, units)
   else
     ya.emit("seek", { units * 5 })
   end
 end
 
 function M:preload(job)
-  run({ "probe", "--input", tostring(job.file.url) })
+  if not content_ready(job.file) then
+    return false
+  end
+  local args = { "probe", "--input", tostring(job.file.path) }
+  if job.file.name then
+    args[#args + 1] = "--name"
+    args[#args + 1] = tostring(job.file.name)
+  end
+  local result = run(args)
+  return result ~= nil
 end
 
 return M
