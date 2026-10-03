@@ -1,29 +1,45 @@
 use flate2::bufread::GzDecoder;
 use image::{GrayImage, ImageBuffer, Luma};
+use nifti::header::MAGIC_CODE_NI1;
 use nifti::volume::ndarray::IntoNdArray;
-use nifti::{NiftiHeader, NiftiObject, NiftiType, StreamedNiftiObject};
+use nifti::{NiftiError, NiftiHeader, NiftiType, StreamedNiftiVolume};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod mgh;
+
 const SCHEMA: u8 = 1;
-const CACHE_VERSION: &str = "ras-resampled-v4";
+const CACHE_VERSION: &str = "ras-resampled-v6";
 const MAX_IMAGE_EDGE: u32 = 2048;
+/// Upper bound on voxels per volume. The f32 volume and window statistics
+/// need roughly 8 bytes per voxel, in addition to temporary decoding buffers.
+/// Reject corrupt headers before allocating their claimed volume size.
+const MAX_VOXELS: usize = 1 << 28;
 const MAX_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 12;
 const CACHE_ACTIVITY_GRACE: Duration = Duration::from_secs(60);
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(15);
+/// Voxels whose magnitude does not exceed this are background and excluded
+/// from the display window statistics.
+const BACKGROUND_EPSILON: f64 = 1e-8;
+/// Display window percentiles over non-background voxels.
+const WINDOW_PERCENTILES: (f64, f64) = (0.5, 99.5);
+/// Number of levels in matplotlib's gray colormap.
+const GRAY_LEVELS: f64 = 256.0;
+const NIFTI1_HEADER_SIZE: u64 = 348;
+const NIFTI1_MIN_DATA_OFFSET: u64 = 352;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("unsupported input: expected a .nii or .nii.gz file")]
+    #[error("unsupported input: expected a .nii, .nii.gz, .mgh or .mgz file")]
     UnsupportedPath,
     #[error("unsupported NIfTI dimensions: expected 3D or 4D, found {0}D")]
     UnsupportedDimensions(u16),
@@ -31,7 +47,13 @@ pub enum Error {
     UnsupportedDatatype(NiftiType),
     #[error("slice {requested} is out of range 0..{count}")]
     SliceOutOfRange { requested: usize, count: usize },
-    #[error("invalid NIfTI geometry: {0}")]
+    #[error("unsupported MGH datatype code: {0}")]
+    UnsupportedMghType(i32),
+    #[error("invalid MGH file: {0}")]
+    InvalidMgh(&'static str),
+    #[error("volume has {0} voxels, more than the preview limit of {MAX_VOXELS}")]
+    VolumeTooLarge(u128),
+    #[error("invalid volume geometry: {0}")]
     InvalidGeometry(&'static str),
     #[error("timed out waiting for cache lock: {0}")]
     LockTimeout(PathBuf),
@@ -51,6 +73,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 enum InputFormat {
     Nii,
     NiiGz,
+    Mgh,
+    Mgz,
 }
 
 impl InputFormat {
@@ -58,6 +82,8 @@ impl InputFormat {
         match self {
             Self::Nii => b"nii",
             Self::NiiGz => b"nii.gz",
+            Self::Mgh => b"mgh",
+            Self::Mgz => b"mgz",
         }
     }
 }
@@ -145,7 +171,13 @@ pub fn probe_named(input: &Path, logical_name: Option<&str>) -> Result<ProbeResu
     if let Some(meta) = read_meta(&cache_dir)? {
         return Ok(meta.probe());
     }
-    Ok(geometry_from_header(&read_header(input, format)?)?.probe())
+    let meta = match format {
+        InputFormat::Nii | InputFormat::NiiGz => geometry_from_header(&read_header(input)?)?,
+        InputFormat::Mgh | InputFormat::Mgz => {
+            geometry_from_mgh(&mgh::read_header(&mut open_input(input)?)?)?
+        }
+    };
+    Ok(meta.probe())
 }
 
 pub fn render(input: &Path, requested_slice: Option<usize>) -> Result<RenderResult> {
@@ -202,25 +234,61 @@ fn input_format(path: &Path, logical_name: Option<&str>) -> Result<InputFormat> 
         Ok(InputFormat::NiiGz)
     } else if name.ends_with(".nii") {
         Ok(InputFormat::Nii)
+    } else if name.ends_with(".mgz") || name.ends_with(".mgh.gz") {
+        Ok(InputFormat::Mgz)
+    } else if name.ends_with(".mgh") {
+        Ok(InputFormat::Mgh)
     } else {
         Err(Error::UnsupportedPath)
     }
 }
 
-fn read_object(path: &Path, format: InputFormat) -> Result<StreamedNiftiObject<InputReader>> {
-    let file = BufReader::new(File::open(path)?);
-    let reader = match format {
-        InputFormat::Nii => InputReader::Plain(file),
-        InputFormat::NiiGz => InputReader::Gzip(GzDecoder::new(file)),
-    };
-    Ok(StreamedNiftiObject::from_reader(reader)?)
+/// Opens the input, decompressing based on the gzip magic bytes rather than
+/// the extension, so mislabeled `.nii`/`.mgh` files still load.
+fn open_input(path: &Path) -> Result<InputReader> {
+    let mut file = BufReader::new(File::open(path)?);
+    Ok(if file.fill_buf()?.starts_with(&[0x1f, 0x8b]) {
+        InputReader::Gzip(GzDecoder::new(file))
+    } else {
+        InputReader::Plain(file)
+    })
 }
 
-fn read_header(path: &Path, format: InputFormat) -> Result<NiftiHeader> {
-    let object = read_object(path, format)?;
-    let header = object.header().clone();
+fn read_header(path: &Path) -> Result<NiftiHeader> {
+    read_header_from(&mut open_input(path)?)
+}
+
+fn read_header_from(reader: &mut impl Read) -> Result<NiftiHeader> {
+    let mut header = NiftiHeader::from_reader(reader)?;
+    if &header.magic == MAGIC_CODE_NI1 {
+        return Err(NiftiError::NoVolumeData.into());
+    }
     validate_header(&header)?;
+    sanitize_scaling(&mut header);
     Ok(header)
+}
+
+/// Applies nibabel's rules for intensity scaling: a zero or non-finite slope
+/// disables scaling entirely. nibabel rejects a valid slope paired with a
+/// non-finite intercept; a preview treats that intercept as zero instead.
+fn sanitize_scaling(header: &mut NiftiHeader) {
+    if header.scl_slope == 0.0 || !header.scl_slope.is_finite() {
+        header.scl_slope = 1.0;
+        header.scl_inter = 0.0;
+    } else if !header.scl_inter.is_finite() {
+        header.scl_inter = 0.0;
+    }
+}
+
+/// Byte offset of the voxel data, honouring `vox_offset` the way nibabel
+/// does: values below the single-file minimum of 352 are raised to it.
+fn data_offset(header: &NiftiHeader) -> u64 {
+    let offset = header.vox_offset;
+    if offset.is_finite() && offset > NIFTI1_MIN_DATA_OFFSET as f32 {
+        offset as u64
+    } else {
+        NIFTI1_MIN_DATA_OFFSET
+    }
 }
 
 fn validate_header(header: &NiftiHeader) -> Result<()> {
@@ -256,7 +324,26 @@ fn geometry_from_header(header: &NiftiHeader) -> Result<CacheMeta> {
         header.dim[2] as usize,
         header.dim[3] as usize,
     ];
-    let affine = selected_affine(header);
+    let fallback_spacing = std::array::from_fn(|axis| header.pixdim[axis + 1].abs());
+    geometry_from_affine(dims, selected_affine(header), fallback_spacing)
+}
+
+fn geometry_from_mgh(header: &mgh::MghHeader) -> Result<CacheMeta> {
+    geometry_from_affine(header.dims, header.affine, header.spacing)
+}
+
+fn geometry_from_affine(
+    dims: [usize; 3],
+    affine: [[f64; 4]; 4],
+    fallback_spacing: [f32; 3],
+) -> Result<CacheMeta> {
+    let voxels = dims
+        .iter()
+        .map(|&dimension| dimension as u128)
+        .product::<u128>();
+    if voxels > MAX_VOXELS as u128 {
+        return Err(Error::VolumeTooLarge(voxels));
+    }
     let vectors = axis_vectors(&affine);
     let mut spacing = [0.0_f32; 3];
     for voxel_axis in 0..3 {
@@ -266,7 +353,7 @@ fn geometry_from_header(header: &NiftiHeader) -> Result<CacheMeta> {
             .sum::<f64>()
             .sqrt() as f32;
         if !spacing[voxel_axis].is_finite() || spacing[voxel_axis] <= 0.0 {
-            spacing[voxel_axis] = header.pixdim[voxel_axis + 1].abs();
+            spacing[voxel_axis] = fallback_spacing[voxel_axis];
         }
         if !spacing[voxel_axis].is_finite() || spacing[voxel_axis] <= 0.0 {
             spacing[voxel_axis] = 1.0;
@@ -357,7 +444,7 @@ fn axis_vectors(affine: &[[f64; 4]; 4]) -> [[f64; 3]; 3] {
     })
 }
 
-fn valid_axis_vectors(vectors: &[[f64; 3]; 3]) -> bool {
+pub(crate) fn valid_axis_vectors(vectors: &[[f64; 3]; 3]) -> bool {
     if vectors.iter().flatten().any(|value| !value.is_finite()) {
         return false;
     }
@@ -500,18 +587,65 @@ fn ensure_image_cache(
     }
 
     fs::create_dir_all(cache_dir)?;
-    let object = read_object(input, format)?;
-    let header = object.header().clone();
-    validate_header(&header)?;
+    let (meta, mut values) = match format {
+        InputFormat::Nii | InputFormat::NiiGz => load_nifti(input)?,
+        InputFormat::Mgh | InputFormat::Mgz => load_mgh(input)?,
+    };
+    let window = display_window(&values);
+    // Invalid voxels render black without poisoning neighboring samples during
+    // interpolation (even a zero-weight NaN would otherwise propagate).
+    let mut background = window.0 as f32;
+    // Round toward negative infinity: rounding above the lower bound can turn
+    // an invalid voxel white when the display window is very narrow.
+    if f64::from(background) > window.0 {
+        background = background.next_down();
+    }
+    for value in &mut values {
+        if !value.is_finite() {
+            *value = background;
+        }
+    }
+    for slice in 0..meta.slice_count() {
+        let image = cache_dir.join(format!("slice-{slice:04}.png"));
+        if !image.is_file() {
+            write_png_atomic(&image, &render_slice(&values, window, &meta, slice)?)?;
+        }
+    }
+    write_atomic(&cache_dir.join("meta.json"), &serde_json::to_vec(&meta)?)?;
+    write_atomic(&cache_dir.join("complete"), b"")?;
+    touch_access(cache_dir, None)?;
+    Ok(())
+}
+
+fn load_mgh(input: &Path) -> Result<(CacheMeta, Vec<f32>)> {
+    let mut reader = open_input(input)?;
+    let header = mgh::read_header(&mut reader)?;
+    let meta = geometry_from_mgh(&header)?;
+    let values = mgh::read_first_frame(&mut reader, &header)?;
+    Ok((meta, values))
+}
+
+/// Loads the first volume as scaled `f32`, matching
+/// `np.asarray(nib.load(path).dataobj, dtype=np.float32)`.
+fn load_nifti(input: &Path) -> Result<(CacheMeta, Vec<f32>)> {
+    let mut reader = open_input(input)?;
+    let header = read_header_from(&mut reader)?;
     let meta = geometry_from_header(&header)?;
+    // Skip extensions and padding up to vox_offset.
+    let skip = data_offset(&header) - NIFTI1_HEADER_SIZE;
+    if io::copy(&mut (&mut reader).take(skip), &mut io::sink())? != skip {
+        return Err(Error::InvalidGeometry("file ends before vox_offset"));
+    }
     let rank = header.dim[0];
-    let mut values = Vec::with_capacity(meta.dims.iter().product());
-    for slice in object.into_volume() {
+    let mut values = Vec::new();
+    for slice in StreamedNiftiVolume::from_reader(reader, &header)? {
+        // Scale before the final f32 cast, so large stored integers are not
+        // rounded before slope/intercept are applied.
         let array = slice?.into_ndarray::<f64>()?;
         let raw = array
             .as_slice_memory_order()
             .ok_or(Error::InvalidGeometry("NIfTI volume is not contiguous"))?;
-        values.extend_from_slice(raw);
+        values.extend(raw.iter().map(|&value| value as f32));
         if rank == 4 {
             break;
         }
@@ -521,17 +655,7 @@ fn ensure_image_cache(
             "first volume size does not match header",
         ));
     }
-    let normalized = normalize(values);
-    for slice in 0..meta.slice_count() {
-        let image = cache_dir.join(format!("slice-{slice:04}.png"));
-        if !image.is_file() {
-            write_png_atomic(&image, &render_slice(&normalized, &meta, slice)?)?;
-        }
-    }
-    write_atomic(&cache_dir.join("meta.json"), &serde_json::to_vec(&meta)?)?;
-    write_atomic(&cache_dir.join("complete"), b"")?;
-    touch_access(cache_dir, None)?;
-    Ok(())
+    Ok((meta, values))
 }
 
 fn touch_access(cache_dir: &Path, slice: Option<usize>) -> Result<()> {
@@ -632,45 +756,81 @@ fn directory_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn normalize(values: impl IntoIterator<Item = f64>) -> Vec<u8> {
-    let values: Vec<f64> = values.into_iter().collect();
-    let mut finite: Vec<f64> = values
+/// Robust, volume-wide contrast matching run_ANT_reg.py. Unlike the script,
+/// binary masks fall back to the full finite range to remain visible.
+fn display_window(values: &[f32]) -> (f64, f64) {
+    let mut tissue: Vec<f32> = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && f64::from(*value).abs() > BACKGROUND_EPSILON)
+        .collect();
+    if tissue.is_empty() {
+        tissue.extend(values.iter().copied().filter(|value| value.is_finite()));
+    }
+    if tissue.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mut low = percentile(&mut tissue, WINDOW_PERCENTILES.0);
+    let mut high = percentile(&mut tissue, WINDOW_PERCENTILES.1);
+    if high <= low {
+        (low, high) = finite_range(&tissue);
+    }
+    if high <= low {
+        (low, high) = finite_range(values);
+    }
+    if high <= low {
+        // Use a relative increment as well: low + 1 can equal low for very
+        // large f32 constants when promoted to f64.
+        high = low + 1.0;
+        if high <= low {
+            high = low + low.abs();
+        }
+    }
+    (low, high)
+}
+
+fn finite_range(values: &[f32]) -> (f64, f64) {
+    values
         .iter()
         .copied()
         .filter(|value| value.is_finite())
-        .collect();
-    if finite.is_empty() {
-        return vec![0; values.len()];
-    }
-    let low_index = ((finite.len() - 1) as f64 * 0.01).round() as usize;
-    let high_index = ((finite.len() - 1) as f64 * 0.99).round() as usize;
-    finite.select_nth_unstable_by(low_index, |a, b| {
-        a.partial_cmp(b).unwrap_or(Ordering::Equal)
-    });
-    let low = finite[low_index];
-    finite.select_nth_unstable_by(high_index, |a, b| {
-        a.partial_cmp(b).unwrap_or(Ordering::Equal)
-    });
-    let high = finite[high_index];
-    if !matches!(high.partial_cmp(&low), Some(Ordering::Greater)) {
-        return values
-            .iter()
-            .map(|value| if value.is_finite() { 128 } else { 0 })
-            .collect();
-    }
-    values
-        .iter()
-        .map(|&value| {
-            if value.is_finite() {
-                (((value.clamp(low, high) - low) / (high - low)) * 255.0).round() as u8
-            } else {
-                0
-            }
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+            (low.min(f64::from(value)), high.max(f64::from(value)))
         })
-        .collect()
 }
 
-fn render_slice(data: &[u8], meta: &CacheMeta, slice: usize) -> Result<GrayImage> {
+/// NumPy's default linear percentile, using selection rather than a full sort.
+/// The sample must be nonempty and contain only finite values.
+fn percentile(values: &mut [f32], percent: f64) -> f64 {
+    let position = (values.len() - 1) as f64 * percent / 100.0;
+    let index = position.floor() as usize;
+    let fraction = position - index as f64;
+    let (_, lower, rest) = values.select_nth_unstable_by(index, f32::total_cmp);
+    let lower = f64::from(*lower);
+    if fraction == 0.0 {
+        return lower;
+    }
+    let upper = rest.iter().copied().min_by(f32::total_cmp).unwrap();
+    lower + (f64::from(upper) - lower) * fraction
+}
+
+/// Linear normalization followed by matplotlib's 256-entry gray LUT indexing.
+fn to_gray(value: f64, (low, high): (f64, f64)) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let index = (((value - low) / (high - low)).clamp(0.0, 1.0) * GRAY_LEVELS).min(255.0) as u8;
+    // The LUT uses linspace(0, 1, 256), then truncates gray * 255 to a byte.
+    // Preserve its floating-point rounding (e.g. index 33 becomes byte 32).
+    (f64::from(index) * (1.0 / 255.0) * 255.0) as u8
+}
+
+fn render_slice(
+    data: &[f32],
+    window: (f64, f64),
+    meta: &CacheMeta,
+    slice: usize,
+) -> Result<GrayImage> {
     if data.len() != meta.dims.iter().product::<usize>() {
         return Err(Error::InvalidGeometry("cached volume size is invalid"));
     }
@@ -708,7 +868,9 @@ fn render_slice(data: &[u8], meta: &CacheMeta, slice: usize) -> Result<GrayImage
             image.put_pixel(
                 column,
                 row,
-                Luma([sample_trilinear(data, &meta.dims, voxel)]),
+                Luma([sample_trilinear(data, &meta.dims, voxel)
+                    .map(|value| to_gray(value, window))
+                    .unwrap_or(0)]),
             );
         }
     }
@@ -727,12 +889,14 @@ fn grid_coordinate(minimum: f64, maximum: f64, index: usize, count: usize, rever
     }
 }
 
-fn sample_trilinear(data: &[u8], dims: &[usize; 3], voxel: [f64; 3]) -> u8 {
+fn sample_trilinear(data: &[f32], dims: &[usize; 3], voxel: [f64; 3]) -> Option<f64> {
     const TOLERANCE: f64 = 1e-6;
     if (0..3).any(|axis| {
-        voxel[axis] < -TOLERANCE || voxel[axis] > dims[axis].saturating_sub(1) as f64 + TOLERANCE
+        !voxel[axis].is_finite()
+            || voxel[axis] < -TOLERANCE
+            || voxel[axis] > dims[axis].saturating_sub(1) as f64 + TOLERANCE
     }) {
-        return 0;
+        return None;
     }
     let voxel = std::array::from_fn::<_, 3, _>(|axis| {
         voxel[axis].clamp(0.0, dims[axis].saturating_sub(1) as f64)
@@ -768,7 +932,7 @@ fn sample_trilinear(data: &[u8], dims: &[usize; 3], voxel: [f64; 3]) -> u8 {
         ),
         fraction[1],
     );
-    interpolate(lower_y, upper_y, fraction[2]).round() as u8
+    Some(interpolate(lower_y, upper_y, fraction[2]))
 }
 
 fn cache_root() -> PathBuf {
@@ -889,19 +1053,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalization_handles_outliers_and_non_finite_values() {
-        let mut values: Vec<f64> = (0..100).map(|value| value as f64).collect();
-        values.extend([10_000.0, f64::NAN, f64::INFINITY]);
-        let normalized = normalize(values);
-        assert_eq!(normalized[101], 0);
-        assert_eq!(normalized[102], 0);
-        assert_eq!(normalized[0], 0);
-        assert_eq!(normalized[100], 255);
+    fn window_excludes_background_and_invalid_values() {
+        let mut values = vec![0.0; 700];
+        values.extend((1..=300).map(|value| value as f32));
+        let expected = (2.495, 298.505);
+        let window = display_window(&values);
+        assert!((window.0 - expected.0).abs() < 1e-10);
+        assert!((window.1 - expected.1).abs() < 1e-10);
+        values.extend([1e-9, -1e-9, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        assert_eq!(display_window(&values), window);
     }
 
     #[test]
-    fn normalization_uses_mid_gray_for_constant_data() {
-        assert_eq!(normalize([7.0, 7.0, f64::NAN]), [128, 128, 0]);
+    fn percentiles_use_linear_interpolation() {
+        let mut values = [4.0, 2.0, 1.0, 3.0];
+        assert!((percentile(&mut values, 0.5) - 1.015).abs() < 1e-12);
+        assert!((percentile(&mut values, 99.5) - 3.985).abs() < 1e-12);
+        assert_eq!(percentile(&mut values, 0.0), 1.0);
+        assert_eq!(percentile(&mut values, 100.0), 4.0);
+        assert_eq!(percentile(&mut [7.0], 99.5), 7.0);
+    }
+
+    #[test]
+    fn window_fallbacks_keep_masks_visible_and_constants_black() {
+        assert_eq!(display_window(&[0.0, 1.0, 1.0, f32::NAN]), (0.0, 1.0));
+        assert_eq!(display_window(&[0.0, 0.0]), (0.0, 1.0));
+        assert_eq!(display_window(&[7.0, 7.0, f32::NAN]), (7.0, 8.0));
+        assert_eq!(display_window(&[f32::NAN, f32::INFINITY]), (0.0, 1.0));
+        assert_eq!(display_window(&[]), (0.0, 1.0));
+        // Percentiles collapse even though rare outliers retain a tissue range.
+        let mut values = vec![7.0; 1000];
+        values.extend([1.0, 20.0]);
+        assert_eq!(display_window(&values), (1.0, 20.0));
+        for value in [7.0, -7.0, f32::MAX, f32::MIN] {
+            let window = display_window(&[value; 2]);
+            assert!(window.1 > window.0);
+            assert_eq!(to_gray(f64::from(value), window), 0);
+        }
+    }
+
+    #[test]
+    fn gray_mapping_matches_matplotlib_lut_and_clipping() {
+        let window = (10.0, 20.0);
+        assert_eq!(to_gray(0.0, window), 0);
+        assert_eq!(to_gray(10.0, window), 0);
+        assert_eq!(to_gray(15.0, window), 128);
+        assert_eq!(to_gray(20.0, window), 255);
+        assert_eq!(to_gray(30.0, window), 255);
+        assert_eq!(to_gray(f64::NAN, window), 0);
+        assert_eq!(to_gray(f64::INFINITY, window), 0);
+        assert_eq!(to_gray(33.0, (0.0, 256.0)), 32);
+        assert_eq!(to_gray(66.0, (0.0, 256.0)), 65);
     }
 
     #[test]
@@ -1006,9 +1208,32 @@ mod tests {
             slice_count: 1,
         };
         assert_eq!(
-            render_slice(&[1, 2, 3, 4], &meta, 0).unwrap().into_raw(),
+            render_slice(&[1.0, 2.0, 3.0, 4.0], (0.0, 256.0), &meta, 0)
+                .unwrap()
+                .into_raw(),
             [4, 3, 2, 1]
         );
+        // A sample halfway between -10 and 30 must be interpolated to 10
+        // before clipping to the display window; clipping first gives 5.
+        let interpolated_meta = CacheMeta {
+            output_width: 3,
+            ..meta.clone()
+        };
+        let pixels = render_slice(
+            &[-10.0, 30.0, -10.0, 30.0],
+            (0.0, 20.0),
+            &interpolated_meta,
+            0,
+        )
+        .unwrap();
+        assert_eq!(pixels.get_pixel(1, 0).0[0], 128);
+        // Out-of-FOV must stay black even when the window spans negative data.
+        let outside_meta = CacheMeta {
+            world_min: [-1.0, 0.0, 0.0],
+            ..meta
+        };
+        let pixels = render_slice(&[0.0; 4], (-10.0, 10.0), &outside_meta, 0).unwrap();
+        assert_eq!(pixels.get_pixel(1, 0).0[0], 0);
     }
 
     #[test]
@@ -1040,8 +1265,10 @@ mod tests {
 
     #[test]
     fn trilinear_sampling_interpolates_all_eight_neighbors() {
-        let data = [0, 10, 20, 30, 40, 50, 60, 70];
-        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [0.5; 3]), 35);
-        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [-1.0, 0.0, 0.0]), 0);
+        let data = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
+        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [0.5; 3]), Some(35.0));
+        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [0.25; 3]), Some(17.5));
+        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [-1.0, 0.0, 0.0]), None);
+        assert_eq!(sample_trilinear(&data, &[2, 2, 2], [f64::NAN; 3]), None);
     }
 }

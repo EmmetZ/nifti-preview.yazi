@@ -30,6 +30,18 @@ local entry_context = ya.sync(function()
       cx.active.preview.skip
 end)
 
+local VOLUME_PATTERNS = { "%.nii$", "%.nii%.gz$", "%.mgh$", "%.mgz$", "%.mgh%.gz$" }
+
+local function is_volume(name)
+  local lower = name:lower()
+  for _, pattern in ipairs(VOLUME_PATTERNS) do
+    if lower:match(pattern) then
+      return true
+    end
+  end
+  return false
+end
+
 local function message(job, text)
   ya.preview_widget(job, ui.Text(text):area(job.area):align(ui.Align.CENTER):wrap(ui.Wrap.YES))
 end
@@ -84,7 +96,7 @@ local function run(args)
   end
   if not output.status.success then
     local detail = output.stderr:gsub("%s+$", "")
-    return nil, detail ~= "" and detail or "NIfTI preview failed"
+    return nil, detail ~= "" and detail or "Volume preview failed"
   end
   local decoded = ya.json_decode(output.stdout)
   if not decoded then
@@ -96,8 +108,8 @@ end
 function M:peek(job)
   if not content_ready(job.file) then
     local text = job.file.url.spec.is_regular
-        and "NIfTI file is not available"
-        or "Remote NIfTI file, download to preview"
+        and "Volume file is not available"
+        or "Remote volume file, download to preview"
     message(job, text)
     return
   end
@@ -149,8 +161,7 @@ function M:entry(job)
   if not url or not path then
     return
   end
-  local lower = url:lower()
-  if lower:match("%.nii$") or lower:match("%.nii%.gz$") then
+  if is_volume(url) then
     if not path_ready(path, is_regular, expected_len) then
       return
     end

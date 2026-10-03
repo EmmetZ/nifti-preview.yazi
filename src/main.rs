@@ -6,7 +6,7 @@ use yazi_nifti_preview::{probe_named, render_named};
 #[command(
     name = "yazi-nifti-preview",
     version,
-    about = "Render NIfTI previews for Yazi"
+    about = "Render NIfTI and FreeSurfer MGH/MGZ previews for Yazi"
 )]
 struct Cli {
     #[command(subcommand)]
